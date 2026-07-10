@@ -1,5 +1,5 @@
 // ============================================================
-// Model Citizn — Client Upload Portal Backend
+// Model Citizn — Client Upload Portal Backend (hardened)
 // Deploy as: Web App → Execute as Me → Anyone can access
 // ============================================================
 
@@ -8,44 +8,87 @@ const TEAM_EMAIL = 'lance@modelcitizn.com';
 const SPREADSHEET_ID = '1Mi5NEXs2FDQxInBJN_M9bilbAGsetA4ehwyYWavvbdc';
 const LOG_TAB_NAME = 'Digital Team onboarding';
 
+// --- Security limits ---
+const MAX_FILE_BYTES = 10 * 1024 * 1024;           // 10 MB per file (matches portal)
+const MAX_UPLOADS_PER_WINDOW = 20;                 // per email
+const RATE_WINDOW_SECONDS = 600;                   // 10 minutes
+const ALLOWED_EXTENSIONS = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'csv', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'pptx', 'txt', 'md', 'zip'];
+const MAX_NAME_LEN = 100;
+const MAX_NOTES_LEN = 2000;
+const MAX_FILENAME_LEN = 180;
+
 // ============================================================
 // TEST FUNCTION — Run this first to verify Drive + Sheets work
-// In the editor: select "testConnection" from the dropdown → Run
-// Check the Execution Log for results
 // ============================================================
 function testConnection() {
   try {
-    // Test 1: Can we access the parent folder?
     const parentFolder = DriveApp.getFolderById(PARENT_FOLDER_ID);
     Logger.log('✓ Parent folder found: ' + parentFolder.getName());
 
-    // Test 2: Can we create a subfolder?
     const testFolderName = '_test_connection_' + Date.now();
     const testFolder = parentFolder.createFolder(testFolderName);
     Logger.log('✓ Test folder created: ' + testFolder.getUrl());
 
-    // Test 3: Can we create a file in it?
     const testBlob = Utilities.newBlob('Hello from test', 'text/plain', 'test.txt');
     const testFile = testFolder.createFile(testBlob);
     Logger.log('✓ Test file created: ' + testFile.getUrl());
 
-    // Test 4: Can we access the spreadsheet?
     const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
     const sheet = ss.getSheetByName(LOG_TAB_NAME);
     Logger.log('✓ Spreadsheet found: ' + ss.getName());
     Logger.log('✓ Tab "' + LOG_TAB_NAME + '" exists: ' + (sheet !== null));
 
-    // Clean up test folder
     testFolder.setTrashed(true);
     Logger.log('✓ Test folder cleaned up');
-
-    Logger.log('');
     Logger.log('=== ALL TESTS PASSED ===');
-    Logger.log('Drive and Sheets connections are working.');
   } catch (err) {
     Logger.log('✗ ERROR: ' + err.toString());
-    Logger.log('Fix this before deploying.');
   }
+}
+
+// ============================================================
+// Sanitizers / validators
+// ============================================================
+function isValidEmail(email) {
+  return /^[^\s@]{1,64}@[^\s@]{1,255}\.[^\s@]{2,}$/.test(email);
+}
+
+function cleanText(value, maxLen) {
+  // Strip control chars and angle brackets, collapse whitespace, cap length
+  return String(value || '')
+    .replace(/[\u0000-\u001f\u007f<>]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLen);
+}
+
+function sanitizeFileName(name) {
+  // Keep only the base name (no path separators), strip dangerous chars
+  let n = String(name || 'unnamed_file');
+  n = n.split(/[\/\\]/).pop();
+  n = n.replace(/[\u0000-\u001f\u007f<>:"|?*]/g, '_').replace(/^\.+/, '_').trim();
+  if (!n) n = 'unnamed_file';
+  return n.slice(0, MAX_FILENAME_LEN);
+}
+
+function getExtension(fileName) {
+  const parts = String(fileName).toLowerCase().split('.');
+  return parts.length > 1 ? parts.pop() : '';
+}
+
+function checkRateLimit(email) {
+  // Returns true if the sender is within limits
+  const cache = CacheService.getScriptCache();
+  const key = 'rl_' + email;
+  const count = Number(cache.get(key) || 0);
+  if (count >= MAX_UPLOADS_PER_WINDOW) return false;
+  cache.put(key, String(count + 1), RATE_WINDOW_SECONDS);
+  return true;
+}
+
+function jsonResponse(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
 }
 
 // ============================================================
@@ -53,122 +96,118 @@ function testConnection() {
 // ============================================================
 function doPost(e) {
   try {
-    Logger.log('doPost called');
-    Logger.log('Has postData: ' + !!e.postData);
-    Logger.log('Has parameter: ' + !!e.parameter);
-    Logger.log('Parameter keys: ' + (e.parameter ? Object.keys(e.parameter).join(', ') : 'none'));
-
-    // Read from form parameter (survives 302 redirect) or fall back to postData
     let raw;
     if (e.parameter && e.parameter.payload) {
       raw = e.parameter.payload;
-      Logger.log('Reading from e.parameter.payload');
     } else if (e.postData && e.postData.contents) {
       raw = e.postData.contents;
-      Logger.log('Reading from e.postData.contents');
     } else {
       throw new Error('No payload received');
     }
 
     const data = JSON.parse(raw);
 
-    const clientName = data.clientName || 'Unknown';
-    const clientEmail = data.clientEmail || '';
-    const clientCompany = data.clientCompany || '';
-    const categories = data.categories || '';
-    const notes = data.notes || '';
-    const fileName = data.fileName || 'unnamed_file';
-    const fileType = data.fileType || 'application/octet-stream';
-    const fileData = data.fileData || '';
+    // --- Validate + sanitize all inputs ---
+    const clientEmail = String(data.clientEmail || '').trim().toLowerCase();
+    if (!isValidEmail(clientEmail)) {
+      return jsonResponse({ status: 'error', message: 'A valid email address is required.' });
+    }
 
-    Logger.log('Upload from: ' + clientName + ' (' + clientEmail + ')');
-    Logger.log('File: ' + fileName + ' (' + fileType + ')');
-    Logger.log('Categories: ' + categories);
+    if (!checkRateLimit(clientEmail)) {
+      return jsonResponse({ status: 'error', message: 'Too many uploads in a short time. Please wait a few minutes and try again.' });
+    }
+
+    const clientName = cleanText(data.clientName, MAX_NAME_LEN) || 'Unknown';
+    const clientCompany = cleanText(data.clientCompany, MAX_NAME_LEN);
+    const categories = cleanText(data.categories, 300);
+    const notes = cleanText(data.notes, MAX_NOTES_LEN);
+    const fileName = sanitizeFileName(data.fileName);
+    const fileData = String(data.fileData || '');
+
+    // --- File type allowlist ---
+    const ext = getExtension(fileName);
+    if (ALLOWED_EXTENSIONS.indexOf(ext) === -1) {
+      return jsonResponse({ status: 'error', message: 'File type ".' + ext + '" is not allowed.' });
+    }
+
+    // --- Size cap (base64 is ~4/3 of raw size) ---
+    if (fileData.length > MAX_FILE_BYTES * 1.37) {
+      return jsonResponse({ status: 'error', message: 'File exceeds the 10 MB limit.' });
+    }
+    if (!fileData) {
+      return jsonResponse({ status: 'error', message: 'No file data received.' });
+    }
+
+    // Never trust the client's MIME type — derive a safe generic one
+    const fileType = 'application/octet-stream';
 
     // Get or create client subfolder using EMAIL as folder name
     const parentFolder = DriveApp.getFolderById(PARENT_FOLDER_ID);
-    const folderName = clientEmail || clientName;
-    const existingFolders = parentFolder.getFoldersByName(folderName);
-
-    let clientFolder;
-    if (existingFolders.hasNext()) {
-      clientFolder = existingFolders.next();
-      Logger.log('Using existing folder: ' + folderName);
-    } else {
-      clientFolder = parentFolder.createFolder(folderName);
-      Logger.log('Created new folder: ' + folderName);
-    }
+    const existingFolders = parentFolder.getFoldersByName(clientEmail);
+    const clientFolder = existingFolders.hasNext()
+      ? existingFolders.next()
+      : parentFolder.createFolder(clientEmail);
 
     // Decode and save file with date prefix
     const decoded = Utilities.base64Decode(fileData);
+    if (decoded.length > MAX_FILE_BYTES) {
+      return jsonResponse({ status: 'error', message: 'File exceeds the 10 MB limit.' });
+    }
     const blob = Utilities.newBlob(decoded, fileType, fileName);
     const datePrefix = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
     blob.setName(datePrefix + '_' + fileName);
     const savedFile = clientFolder.createFile(blob);
 
-    Logger.log('File saved: ' + savedFile.getUrl());
-
-    // Log to spreadsheet
     logUpload(clientName, clientEmail, clientCompany, categories, notes, fileName, savedFile.getUrl());
-
-    // Email notification
     sendNotification(clientName, clientEmail, clientCompany, categories, notes, fileName, savedFile.getUrl());
 
-    Logger.log('Upload complete');
-
-    return ContentService.createTextOutput(
-      JSON.stringify({ status: 'success', fileUrl: savedFile.getUrl() })
-    ).setMimeType(ContentService.MimeType.JSON);
+    // Do not echo the Drive URL back to the browser
+    return jsonResponse({ status: 'success' });
 
   } catch (err) {
     Logger.log('Upload error: ' + err.toString());
-    return ContentService.createTextOutput(
-      JSON.stringify({ status: 'error', message: err.toString() })
-    ).setMimeType(ContentService.MimeType.JSON);
+    // Generic message — don't leak internals to the client
+    return jsonResponse({ status: 'error', message: 'Upload failed. Please try again.' });
   }
 }
 
 // ============================================================
-// GET handler — health check
+// GET handler — health check + history lookup
 // ============================================================
 function doGet(e) {
-  Logger.log('doGet called');
-
   // History lookup: ?action=history&email=client@example.com
   if (e && e.parameter && e.parameter.action === 'history') {
     const email = String(e.parameter.email || '').trim().toLowerCase();
     const out = { status: 'ok', uploads: [] };
     try {
-      if (email) {
+      if (email && isValidEmail(email)) {
         const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
         const sheet = ss.getSheetByName(LOG_TAB_NAME);
         if (sheet && sheet.getLastRow() > 1) {
           const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 8).getValues();
           rows.forEach(function (r) {
             if (String(r[2]).trim().toLowerCase() === email) {
+              // NOTE: no fileUrl here — Drive links are never exposed publicly
               out.uploads.push({
                 timestamp: r[0] ? new Date(r[0]).toISOString() : '',
                 clientName: String(r[1] || ''),
                 categories: String(r[4] || ''),
                 notes: String(r[5] || ''),
-                fileName: String(r[6] || ''),
-                fileUrl: String(r[7] || '')
+                fileName: String(r[6] || '')
               });
             }
           });
         }
       }
     } catch (err) {
+      Logger.log('History error: ' + err.toString());
       out.status = 'error';
-      out.message = err.toString();
+      out.message = 'Could not load history.';
     }
-    return ContentService.createTextOutput(JSON.stringify(out))
-      .setMimeType(ContentService.MimeType.JSON);
+    return jsonResponse(out);
   }
 
-  return ContentService.createTextOutput(
-    JSON.stringify({ status: 'ok', message: 'MC Upload Portal backend is running.' })
-  ).setMimeType(ContentService.MimeType.JSON);
+  return jsonResponse({ status: 'ok', message: 'MC Upload Portal backend is running.' });
 }
 
 // ============================================================
@@ -180,13 +219,7 @@ function logUpload(name, email, company, categories, notes, fileName, fileUrl) {
 
   if (!sheet) {
     sheet = ss.insertSheet(LOG_TAB_NAME);
-    sheet.appendRow([
-      'Timestamp', 'Client Name', 'Email', 'Company',
-      'Categories', 'Notes', 'File Name', 'File URL'
-    ]);
-    sheet.getRange(1, 1, 1, 8).setFontWeight('bold');
   }
-
   if (sheet.getLastRow() === 0) {
     sheet.appendRow([
       'Timestamp', 'Client Name', 'Email', 'Company',
@@ -195,23 +228,11 @@ function logUpload(name, email, company, categories, notes, fileName, fileUrl) {
     sheet.getRange(1, 1, 1, 8).setFontWeight('bold');
   }
 
-  sheet.appendRow([
-    new Date(),
-    name,
-    email,
-    company,
-    categories,
-    notes,
-    fileName,
-    fileUrl
-  ]);
-
-  Logger.log('Logged to spreadsheet');
+  sheet.appendRow([new Date(), name, email, company, categories, notes, fileName, fileUrl]);
 }
 
 function sendNotification(name, email, company, categories, notes, fileName, fileUrl) {
   var subject = 'New upload from ' + name + (company ? ' (' + company + ')' : '');
-
   var body = [
     'New file uploaded via Client Portal',
     '',
@@ -228,5 +249,4 @@ function sendNotification(name, email, company, categories, notes, fileName, fil
   ].join('\n');
 
   MailApp.sendEmail(TEAM_EMAIL, subject, body);
-  Logger.log('Notification sent to ' + TEAM_EMAIL);
 }
